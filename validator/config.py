@@ -124,9 +124,20 @@ MIGRATION_SPEC: list[TableSpec] = [
 # that a mapping was missed and the column silently stopped being populated.
 NULL_RATE_DRIFT_TOLERANCE = 0.05     # 5 percentage points
 
-# Value-level diff runs on a sample rather than every row, because on a large
+# Value-level diff can run on a sample rather than every row, because on a large
 # migration comparing every column of every row is slow and rarely necessary.
-VALUE_DIFF_SAMPLE_SIZE = 500
+#
+# Set to 0 to always compare every row. When the table is smaller than this
+# figure the check performs a full comparison and says so in the report --
+# "no differences found" means something very different after a full scan than
+# after sampling 500 rows out of two million, and the report must not blur that.
+VALUE_DIFF_SAMPLE_SIZE = 5000
+
+# Floating point columns cannot be compared for exact equality: 0.1 + 0.2 is not
+# 0.3 in binary floating point, so an exact test reports differences that are
+# artefacts of representation rather than genuine migration defects. Two float
+# values are treated as equal when they differ by less than this.
+FLOAT_COMPARISON_TOLERANCE = 0.005
 
 
 def get_table(name: str) -> TableSpec:

@@ -93,16 +93,42 @@ remember to look at.
 
 | # | Check | Shape | Catches | Status |
 |---|---|---|---|---|
-| 1 | Row count reconciliation | aggregate comparison | wholesale row loss or duplication | implemented |
-| 2 | Orphaned foreign keys | anti-join | children whose parent never migrated | implemented |
-| 3 | Primary key integrity | `GROUP BY … HAVING` | duplicated or null technical keys | in progress |
-| 4 | Duplicate business keys | `GROUP BY … HAVING` | the same real entity under two IDs | in progress |
-| 5 | Null rate drift | aggregate comparison | a column that silently stopped populating | in progress |
-| 6 | Value level diff | inner join + `IS DISTINCT FROM` | contents changed on rows that survived | in progress |
+| 1 | Row count reconciliation | aggregate comparison | wholesale row loss or duplication | FAIL |
+| 2 | Primary key integrity | window functions | duplicated or null technical keys | FAIL |
+| 3 | Orphaned foreign keys | anti-join | children whose parent never migrated | FAIL |
+| 4 | Duplicate business keys | window functions | the same real entity under two IDs | WARN |
+| 5 | Null rate drift | aggregate comparison | a column that silently stopped populating | FAIL / WARN |
+| 6 | Value level diff | inner join + `IS DISTINCT FROM` | contents changed on rows that survived | FAIL |
 
 Reconciliation SQL is almost always one of three shapes — an aggregate
-comparison, an anti-join, or a `GROUP BY … HAVING`. The checks are organised
-around that, which is why adding a new one is short.
+comparison, an anti-join, or a partition-and-count. The checks are organised
+around that, which is why adding a new one is short. All of the SQL lives in
+`validator/checks.py`, alongside the reasoning for each query.
+
+Check 4 reports WARN rather than FAIL by design: it is a heuristic, and a false
+positive that blocks a release is expensive. It surfaces candidates for a human
+to judge rather than stopping the migration on the tool's own authority. Note
+the consequence — a WARN does not affect the exit code, so this check alone
+will not fail a CI gate.
+
+### Verifying it against known defects
+
+`seed/build_demo.py` injects six specific defects, listed there in plain SQL.
+Each maps to exactly one check, so a broken run should catch all six:
+
+| Defect | Caught by |
+|---|---|
+| D1 — 12 payments dropped | row count reconciliation |
+| D2 — 4 properties never migrated | row counts + orphaned FK on tenancies |
+| D3 — 2 properties inserted twice | primary key integrity |
+| D4 — 3 landlords duplicated on email | duplicate business keys |
+| D5 — landlord phone nulled for ~40% | null rate drift *and* value level diff |
+| D6 — 7 payment amounts altered | value level diff |
+
+D5 is deliberately caught twice, from two angles: as a statistical shift in how
+often the column is populated, and as 60 specific rows whose phone number
+changed. Two checks agreeing on a defect from different directions is a useful
+property, not double-counting.
 
 ### Why 3 and 4 are separate
 
@@ -120,11 +146,19 @@ in three acquired CRMs, deduplicating on a business key is the whole problem.
   inherent to comparing totals, not a bug — it is why checks 3 and 4 exist. The
   limitation is asserted as a passing test in `tests/test_checks.py` so that
   nobody reads a green row count and concludes the migration is sound.
-- **Value-level diff is sampled**, not exhaustive, on large tables. The report
-  states the sample size; "no differences found" means none in the sample.
+- **Value-level diff can be sampled** rather than exhaustive on large tables,
+  controlled by `VALUE_DIFF_SAMPLE_SIZE`. The report always states which was
+  done — "no differences found" means something very different after a full
+  scan than after sampling 500 rows out of two million.
+- **Float comparison uses a tolerance** (`FLOAT_COMPARISON_TOLERANCE`), because
+  exact equality on floating point reports representation artefacts as defects.
+  A genuine difference smaller than the tolerance will not be reported.
 - **Business key duplicate detection is a heuristic.** It finds entities that
-  match on the configured key. It cannot find the same landlord recorded under
-  two different email addresses.
+  match on the configured key, after normalising case and whitespace. It cannot
+  find the same landlord recorded under two different email addresses.
+- **Null rate drift needs volume to be meaningful.** On a small table a single
+  null can exceed the tolerance, so the threshold is better suited to tables of
+  a few hundred rows and up.
 - **Demo data is synthetic.** The schema models a UK lettings CRM migration
   (landlords → properties → tenancies → payments) but is generated, not real.
 

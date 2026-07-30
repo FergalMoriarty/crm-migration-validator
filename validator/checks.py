@@ -37,6 +37,7 @@ Almost every check below is one of those three.
 import pandas as pd
 
 from .config import (
+    FLOAT_COMPARISON_TOLERANCE,
     NULL_RATE_DRIFT_TOLERANCE,
     VALUE_DIFF_SAMPLE_SIZE,
     ForeignKey,
@@ -236,14 +237,88 @@ def check_primary_key_integrity(
     SKETCH -- nulls:
         SELECT COUNT(*) FROM tgt_{table} WHERE {pk} IS NULL
 
-    THINGS TO DECIDE
-    - Report duplicates and nulls as one result or two? One is simpler to read;
-      two is easier to act on. Your call -- document whichever you choose.
-    - The summary line should carry the count, not just "found duplicates".
-      Compare "3 duplicate keys" against "3 duplicate keys affecting 47 rows":
-      the second tells the reader how much damage there is.
+    IMPLEMENTATION NOTES
+
+    Duplicates and nulls are reported as ONE result rather than two. Both are
+    failures of the same property -- "this column identifies exactly one row" --
+    and splitting them doubles the length of the report without telling the
+    reader anything they could act on separately.
+
+    The summary carries two numbers, not one: how many keys are duplicated, and
+    how many rows that affects. "3 duplicate keys" and "3 duplicate keys
+    affecting 47 rows" are very different situations to walk into.
+
+    A note on the window function: COUNT(*) OVER (PARTITION BY pk) deliberately
+    has NO ORDER BY. Adding one changes the default frame to
+    RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, which turns the whole
+    partition total into a running count. Here it would happen to give the right
+    answer -- ordering by the partition column makes every row a peer, and RANGE
+    frames include peers -- but it would silently under-report the moment the
+    ORDER BY column differed from the PARTITION BY column. An unordered window
+    is the whole-partition aggregate we actually want.
     """
-    raise NotImplementedError("Implement check_primary_key_integrity")
+    pk = table.primary_key
+    view = f"tgt_{table.name}"
+
+    # -- nulls ------------------------------------------------------------
+    null_count = engine.scalar(f'SELECT COUNT(*) FROM {view} WHERE "{pk}" IS NULL')
+
+    # -- duplicates -------------------------------------------------------
+    # ROW_NUMBER() lets us collapse each duplicated key to a single evidence
+    # row (occurrence = 1) while COUNT(*) OVER still reports how many times the
+    # key appears in total. One pass, both numbers.
+    duplicates = engine.query(
+        f"""
+        WITH keyed AS (
+            SELECT "{pk}"                                      AS pk,
+                   ROW_NUMBER() OVER (PARTITION BY "{pk}")     AS occurrence,
+                   COUNT(*)     OVER (PARTITION BY "{pk}")     AS occurrences
+            FROM {view}
+            WHERE "{pk}" IS NOT NULL
+        )
+        SELECT pk AS duplicate_pk, occurrences
+        FROM keyed
+        WHERE occurrences > 1
+          AND occurrence = 1
+        ORDER BY occurrences DESC, duplicate_pk
+        """
+    )
+
+    duplicate_keys = len(duplicates)
+    affected_rows = int(duplicates["occurrences"].sum()) if duplicate_keys else 0
+
+    metrics = {
+        "duplicate_keys": duplicate_keys,
+        "rows_affected_by_duplicates": affected_rows,
+        "null_keys": null_count,
+    }
+
+    if duplicate_keys == 0 and null_count == 0:
+        return CheckResult(
+            check="primary_key_integrity",
+            table=table.name,
+            status=Status.PASS,
+            summary=f"{pk} is unique and non-null",
+            metrics=metrics,
+        )
+
+    problems = []
+    if duplicate_keys:
+        problems.append(
+            f"{duplicate_keys:,} duplicate {pk} values affecting {affected_rows:,} rows"
+        )
+    if null_count:
+        problems.append(f"{null_count:,} rows with a null {pk}")
+
+    return CheckResult(
+        check="primary_key_integrity",
+        table=table.name,
+        status=Status.FAIL,
+        summary="; ".join(problems),
+        offenders=duplicates.head(EVIDENCE_LIMIT) if duplicate_keys else None,
+        offender_count=affected_rows + null_count,
+        metrics=metrics,
+    )
 
 
 # ===========================================================================
@@ -274,20 +349,102 @@ def check_duplicate_business_keys(
         GROUP BY {business_key_cols}
         HAVING COUNT(*) > 1
 
-    THINGS TO DECIDE
-    - Some tables have no business key defined. Return a PASS with a summary
-      saying it was not applicable, or skip silently? Prefer being explicit --
-      a check that quietly does nothing is worse than one that says so.
-    - Case and whitespace. 'F.Moriarty@x.com' and 'fmoriarty@x.com  ' are the
-      same landlord to a human. Do you normalise with LOWER(TRIM(...)) before
-      grouping? Doing so catches more real duplicates; not doing so is more
-      literal. Whichever you pick, say so in the docstring -- an interviewer
-      is more likely to ask about this than about anything else in the file.
-    - Should this be FAIL or WARN? Genuine duplicates are a blocker, but the
-      check is a heuristic, so there is a real argument for WARN. Decide, and
-      be able to defend it.
+    DECISIONS TAKEN, AND WHY
+
+    1. Normalisation: business key values are compared as
+       LOWER(TRIM(CAST(col AS VARCHAR))).
+
+       'F.Moriarty@example.com' and 'fmoriarty@example.com  ' are the same
+       landlord to any human being, and a migration that preserves the casing
+       difference from two source CRMs would otherwise slip past. Normalising
+       catches more genuine duplicates at the cost of occasionally flagging two
+       records a purist would call distinct. On a roll-up, where the same
+       landlord genuinely does exist in several acquired systems, that trade is
+       worth making.
+
+       CAST to VARCHAR first so composite keys mixing text, numbers and dates
+       normalise through one code path.
+
+    2. Status is WARN, not FAIL.
+
+       This check is a heuristic. It cannot know that two records with the same
+       email are truly the same person, and a false positive that blocks a
+       migration is expensive. WARN puts it in front of a human without
+       stopping the release on the tool's own judgement. Note the consequence:
+       a WARN does not affect the exit code, so this check alone will not fail
+       a CI gate. That is the intended behaviour -- deduplication is a decision
+       for a person, not for a regex-equivalent.
+
+    3. Tables with no business key return an explicit PASS saying so, rather
+       than being skipped. A check that quietly does nothing is worse than one
+       that says it did nothing, because silence reads as success.
     """
-    raise NotImplementedError("Implement check_duplicate_business_keys")
+    if not table.business_key:
+        return CheckResult(
+            check="duplicate_business_keys",
+            table=table.name,
+            status=Status.PASS,
+            summary="no business key configured -- check not applicable",
+        )
+
+    view = f"tgt_{table.name}"
+
+    # Normalised expressions used for grouping, and the raw columns used for
+    # evidence. The reader of the report needs to see the real values, not the
+    # normalised ones.
+    normalised = ", ".join(
+        f'LOWER(TRIM(CAST("{col}" AS VARCHAR)))' for col in table.business_key
+    )
+    raw_columns = ", ".join(f'"{col}"' for col in table.business_key)
+
+    duplicates = engine.query(
+        f"""
+        WITH keyed AS (
+            SELECT {raw_columns},
+                   "{table.primary_key}"                          AS example_id,
+                   ROW_NUMBER() OVER (PARTITION BY {normalised})  AS occurrence,
+                   COUNT(*)     OVER (PARTITION BY {normalised})  AS occurrences
+            FROM {view}
+        )
+        SELECT {raw_columns}, occurrences
+        FROM keyed
+        WHERE occurrences > 1
+          AND occurrence = 1
+        ORDER BY occurrences DESC, {raw_columns}
+        """
+    )
+
+    duplicate_entities = len(duplicates)
+    affected_rows = int(duplicates["occurrences"].sum()) if duplicate_entities else 0
+    key_description = " + ".join(table.business_key)
+
+    metrics = {
+        "business_key": key_description,
+        "duplicate_entities": duplicate_entities,
+        "rows_affected": affected_rows,
+    }
+
+    if duplicate_entities == 0:
+        return CheckResult(
+            check="duplicate_business_keys",
+            table=table.name,
+            status=Status.PASS,
+            summary=f"no duplicate entities on ({key_description})",
+            metrics=metrics,
+        )
+
+    return CheckResult(
+        check="duplicate_business_keys",
+        table=table.name,
+        status=Status.WARN,
+        summary=(
+            f"{duplicate_entities:,} entities appear more than once on "
+            f"({key_description}), affecting {affected_rows:,} rows"
+        ),
+        offenders=duplicates.head(EVIDENCE_LIMIT),
+        offender_count=affected_rows,
+        metrics=metrics,
+    )
 
 
 # ===========================================================================
@@ -327,14 +484,117 @@ def check_null_rate_drift(
       a WARN, not a FAIL, because it is often intentional.
     - Returns a list: one result per drifted column.
 
-    A PRACTICAL WARNING
-    On a wide table this runs one aggregate per column, which is slow if done
-    naively in a Python loop. You can compute every column's null count in a
-    single SELECT with one FILTER expression per column. Worth doing, and worth
-    mentioning in interview -- it shows you thought about cost, not just
-    correctness.
+    IMPLEMENTATION NOTES
+
+    - Only columns present on BOTH sides are compared. A column that exists on
+      one side only is a schema difference, which is a different finding and
+      would be misleading reported as drift.
+
+    - Null counts for every column are computed in ONE aggregate per side, using
+      one COUNT(*) FILTER expression per column, rather than looping in Python
+      and issuing one query per column. On a wide table the difference is two
+      queries against dozens.
+
+    - Direction matters and is treated differently:
+        target emptier than source  -> FAIL. Data was lost.
+        target fuller than source   -> WARN. Usually defaults applied during
+                                       migration, which is often intentional,
+                                       but worth a human glance.
     """
-    raise NotImplementedError("Implement check_null_rate_drift")
+    src_view = f"src_{table.name}"
+    tgt_view = f"tgt_{table.name}"
+
+    src_columns = engine.columns(src_view)
+    tgt_columns = engine.columns(tgt_view)
+    shared = [c for c in src_columns if c in tgt_columns]
+
+    if not shared:
+        return [
+            CheckResult(
+                check="null_rate_drift",
+                table=table.name,
+                status=Status.WARN,
+                summary="source and target share no columns -- schema mismatch",
+            )
+        ]
+
+    def null_rates(view: str) -> tuple[int, dict[str, int]]:
+        """One query, one COUNT(*) FILTER per column."""
+        expressions = ", ".join(
+            f'COUNT(*) FILTER (WHERE "{c}" IS NULL) AS "null_{c}"' for c in shared
+        )
+        row = engine.query(f"SELECT COUNT(*) AS total_rows, {expressions} FROM {view}")
+        total = int(row["total_rows"].iloc[0])
+        nulls = {c: int(row[f"null_{c}"].iloc[0]) for c in shared}
+        return total, nulls
+
+    src_total, src_nulls = null_rates(src_view)
+    tgt_total, tgt_nulls = null_rates(tgt_view)
+
+    # An empty table on either side makes a rate meaningless.
+    if src_total == 0 or tgt_total == 0:
+        return [
+            CheckResult(
+                check="null_rate_drift",
+                table=table.name,
+                status=Status.WARN,
+                summary=f"cannot compare null rates (source {src_total} rows, "
+                        f"target {tgt_total} rows)",
+            )
+        ]
+
+    results: list[CheckResult] = []
+
+    for column in shared:
+        src_rate = src_nulls[column] / src_total
+        tgt_rate = tgt_nulls[column] / tgt_total
+        drift = tgt_rate - src_rate
+
+        if abs(drift) <= NULL_RATE_DRIFT_TOLERANCE:
+            continue
+
+        metrics = {
+            "source_null_rate": f"{src_rate:.1%}",
+            "target_null_rate": f"{tgt_rate:.1%}",
+            "drift": f"{drift:+.1%}",
+            "tolerance": f"{NULL_RATE_DRIFT_TOLERANCE:.1%}",
+        }
+
+        if drift > 0:
+            results.append(CheckResult(
+                check=f"null_rate_drift[{column}]",
+                table=table.name,
+                status=Status.FAIL,
+                summary=(
+                    f"{column} is emptier after migration: "
+                    f"{src_rate:.1%} null in source, {tgt_rate:.1%} in target"
+                ),
+                offender_count=tgt_nulls[column] - src_nulls[column],
+                metrics=metrics,
+            ))
+        else:
+            results.append(CheckResult(
+                check=f"null_rate_drift[{column}]",
+                table=table.name,
+                status=Status.WARN,
+                summary=(
+                    f"{column} is fuller after migration "
+                    f"({src_rate:.1%} -> {tgt_rate:.1%} null); defaults applied?"
+                ),
+                metrics=metrics,
+            ))
+
+    if not results:
+        return [
+            CheckResult(
+                check="null_rate_drift",
+                table=table.name,
+                status=Status.PASS,
+                summary=f"null rates stable across {len(shared)} shared columns",
+            )
+        ]
+
+    return results
 
 
 # ===========================================================================
@@ -369,20 +629,150 @@ def check_value_level_diff(
     Using != here is a classic reconciliation bug that makes a broken migration
     look clean.
 
-    THINGS TO DECIDE
-    - Sample or full scan? VALUE_DIFF_SAMPLE_SIZE exists in config for this.
-      Sampling makes the check cheap on a large migration but means it can
-      miss defects. Be explicit in the report about which you did -- claiming
-      "no value differences" after checking 500 of 2,000,000 rows would be
-      misleading, and this employer is hiring specifically for the judgement
-      not to do that.
-    - Floats. If any column is floating point, exact comparison will produce
-      false positives from representation error. Consider a tolerance, or
-      round both sides, for numeric columns.
-    - Which columns? All shared columns, or a configured subset? All is more
-      thorough; a subset is faster and less noisy.
+    DECISIONS TAKEN, AND WHY
+
+    1. Sampling. Controlled by VALUE_DIFF_SAMPLE_SIZE. When the source table is
+       smaller than that figure the comparison is exhaustive, and the summary
+       says "full". When it is larger, the summary says how many rows were
+       sampled out of how many. "No value differences found" means something
+       entirely different after a full scan than after sampling 500 rows out of
+       two million, and the report must never blur the two.
+
+    2. Floats. Exact equality on floating point produces differences that are
+       artefacts of binary representation rather than migration defects, so
+       numeric columns use an absolute tolerance (FLOAT_COMPARISON_TOLERANCE).
+       NULLs are still handled by IS DISTINCT FROM before the tolerance applies,
+       so a value that became NULL is always reported.
+
+    3. All shared columns are compared, excluding the primary key -- it is the
+       join condition, so by definition it cannot differ.
+
+    WHY IS DISTINCT FROM AND NOT !=
+    In SQL, NULL != NULL evaluates to NULL, not TRUE, so the row is filtered
+    out. A plain != therefore silently misses every row where exactly one side
+    is NULL -- precisely the rows most worth catching. IS DISTINCT FROM treats
+    NULL as a comparable value and returns TRUE when one side is NULL and the
+    other is not. Using != here is a classic reconciliation bug that makes a
+    broken migration look clean.
     """
-    raise NotImplementedError("Implement check_value_level_diff")
+    pk = table.primary_key
+    src_view = f"src_{table.name}"
+    tgt_view = f"tgt_{table.name}"
+
+    src_columns = engine.columns(src_view)
+    tgt_columns = engine.columns(tgt_view)
+    shared = [c for c in src_columns if c in tgt_columns and c != pk]
+
+    if not shared:
+        return CheckResult(
+            check="value_level_diff",
+            table=table.name,
+            status=Status.WARN,
+            summary="no shared non-key columns to compare",
+        )
+
+    # Column types drive the float handling. DESCRIBE returns one row per
+    # column with its declared type.
+    described = engine.query(f"DESCRIBE {src_view}")
+    column_types = dict(zip(described["column_name"], described["column_type"]))
+    float_types = {"FLOAT", "DOUBLE", "REAL"}
+
+    def is_float(column: str) -> bool:
+        declared = str(column_types.get(column, "")).upper()
+        return any(t in declared for t in float_types) or declared.startswith("DECIMAL")
+
+    # Decide sample vs full scan.
+    source_rows = engine.scalar(f"SELECT COUNT(*) FROM {src_view}")
+    sample_size = VALUE_DIFF_SAMPLE_SIZE
+    sampled = bool(sample_size) and source_rows > sample_size
+
+    sample_cte = (
+        f'SELECT * FROM {src_view} ORDER BY "{pk}" LIMIT {sample_size}'
+        if sampled else
+        f"SELECT * FROM {src_view}"
+    )
+
+    # One SELECT per column, UNION ALLed together. This shape means the result
+    # is already in long form -- one row per differing value -- which is what a
+    # reader needs: the key, the column, and both values side by side.
+    blocks = []
+    for column in shared:
+        if is_float(column):
+            # IS DISTINCT FROM first so NULL transitions are always caught,
+            # then the tolerance filter for genuine numeric drift.
+            comparison = (
+                f'(s."{column}" IS DISTINCT FROM t."{column}") '
+                f'AND (s."{column}" IS NULL OR t."{column}" IS NULL '
+                f'     OR ABS(CAST(s."{column}" AS DOUBLE) - CAST(t."{column}" AS DOUBLE)) '
+                f'        > {FLOAT_COMPARISON_TOLERANCE})'
+            )
+        else:
+            comparison = f's."{column}" IS DISTINCT FROM t."{column}"'
+
+        blocks.append(
+            f"""
+            SELECT s."{pk}"                     AS {pk},
+                   '{column}'                   AS column_name,
+                   CAST(s."{column}" AS VARCHAR) AS source_value,
+                   CAST(t."{column}" AS VARCHAR) AS target_value
+            FROM sampled s
+            JOIN {tgt_view} t ON s."{pk}" = t."{pk}"
+            WHERE {comparison}
+            """
+        )
+
+    union_sql = " UNION ALL ".join(blocks)
+
+    rows_compared = engine.scalar(
+        f"""
+        WITH sampled AS ({sample_cte})
+        SELECT COUNT(*) FROM sampled s JOIN {tgt_view} t ON s."{pk}" = t."{pk}"
+        """
+    )
+
+    difference_count = engine.scalar(
+        f"WITH sampled AS ({sample_cte}) SELECT COUNT(*) FROM ({union_sql})"
+    )
+
+    scope = (
+        f"sampled {sample_size:,} of {source_rows:,} source rows"
+        if sampled else
+        f"full comparison of {source_rows:,} source rows"
+    )
+
+    metrics = {
+        "rows_compared": rows_compared,
+        "columns_compared": len(shared),
+        "scope": scope,
+    }
+
+    if difference_count == 0:
+        return CheckResult(
+            check="value_level_diff",
+            table=table.name,
+            status=Status.PASS,
+            summary=f"no value differences ({scope})",
+            metrics=metrics,
+        )
+
+    offenders = engine.query(
+        f"""
+        WITH sampled AS ({sample_cte})
+        SELECT * FROM ({union_sql})
+        ORDER BY {pk}, column_name
+        LIMIT {EVIDENCE_LIMIT}
+        """
+    )
+
+    return CheckResult(
+        check="value_level_diff",
+        table=table.name,
+        status=Status.FAIL,
+        summary=f"{difference_count:,} values differ between source and target ({scope})",
+        offenders=offenders,
+        offender_count=difference_count,
+        metrics=metrics,
+    )
 
 
 # ===========================================================================
@@ -392,18 +782,18 @@ def check_value_level_diff(
 # The runner iterates this list. Order matters only for readability of the
 # report -- checks are independent of each other.
 #
-# Uncomment each entry as you implement it. Keeping unimplemented checks out
-# of the registry means the tool always runs cleanly; a half-finished check
-# that raises NotImplementedError mid-run would be reported as an ERROR, which
-# is correct behaviour but unhelpful while you are still building.
+# Order is chosen for readability of the report: cheap structural checks first
+# (did the rows arrive, are the keys sound), then relationship and content
+# checks. The checks are independent of one another, so the order has no effect
+# on results.
 
 CHECK_REGISTRY = [
     check_row_counts,
+    check_primary_key_integrity,
     check_orphaned_foreign_keys,
-    # check_primary_key_integrity,
-    # check_duplicate_business_keys,
-    # check_null_rate_drift,
-    # check_value_level_diff,
+    check_duplicate_business_keys,
+    check_null_rate_drift,
+    check_value_level_diff,
 ]
 
 
