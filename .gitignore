@@ -1,0 +1,9 @@
+# Generated demo data -- rebuild with `python -m seed.build_demo`
+data/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+.vscode/
