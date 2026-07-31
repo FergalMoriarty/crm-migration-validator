@@ -201,7 +201,7 @@ def _check_single_fk(
         table=table.name,
         status=Status.FAIL,
         summary=(
-            f"{orphan_count:,} rows reference a {fk.parent_table} "
+            f"{orphan_count:,} rows reference a {fk.parent_table} row "
             f"that does not exist in the target"
         ),
         offenders=offenders,

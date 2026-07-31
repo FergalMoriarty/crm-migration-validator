@@ -120,6 +120,12 @@ class ValidationReport:
                     shown = r.offenders.head(self.MAX_EXAMPLE_ROWS)
                     lines.append("")
                     lines.append(f"  Example rows ({len(shown)} of {r.offender_count}):")
+                    # Nulls are rendered as NULL, not Python's None: the reader
+                    # is looking at database values and NULL is what they mean.
+                    # fillna rather than to_string(na_rep=...) because pandas
+                    # ignores na_rep on object-dtype columns, which is exactly
+                    # what a mixed source/target value column ends up as.
+                    shown = shown.fillna("NULL")
                     for line in shown.to_string(index=False).splitlines():
                         lines.append(f"    {line}")
             lines.append("")
