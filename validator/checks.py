@@ -734,10 +734,16 @@ def check_value_level_diff(
         f"WITH sampled AS ({sample_cte}) SELECT COUNT(*) FROM ({union_sql})"
     )
 
+    # Report the number of rows actually COMPARED, not the number of source
+    # rows, because they differ whenever rows are missing from the target.
+    # Saying "full comparison of 1,500 source rows" while only 1,488 could be
+    # joined invites the reader to think 1,500 were checked. The unmatched rows
+    # are check 1's finding, not this one's, but the wording must not obscure
+    # that they went uncompared here.
     scope = (
-        f"sampled {sample_size:,} of {source_rows:,} source rows"
+        f"{rows_compared:,} matched rows compared, sampled from {source_rows:,}"
         if sampled else
-        f"full comparison of {source_rows:,} source rows"
+        f"{rows_compared:,} of {source_rows:,} source rows compared in full"
     )
 
     metrics = {

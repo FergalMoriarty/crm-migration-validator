@@ -605,8 +605,11 @@ def test_value_diff_passes_when_identical(tmp_path):
         result = check_value_level_diff(engine, PAYMENT_SPEC)
 
     assert result.status is Status.PASS
-    # The report must distinguish a full comparison from a sampled one.
-    assert "full comparison" in result.summary
+    # The report must distinguish a full comparison from a sampled one, and
+    # must state how many rows were actually compared rather than how many
+    # existed in the source.
+    assert "compared in full" in result.summary
+    assert result.metrics["rows_compared"] == 5
 
 
 def test_value_diff_detects_changed_amount(tmp_path):
