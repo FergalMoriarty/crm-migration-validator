@@ -1,4 +1,4 @@
-# migration-validator
+# crm-migration-validator
 
 A read-only reconciliation tool for CRM data migrations.
 
@@ -37,10 +37,9 @@ two naming conventions the engine sets up:
 | `src_<table>` | the source CSV export — the *before* picture |
 | `tgt_<table>` | the migrated target table — the *after* picture |
 
-The target is a DuckDB file by default so the repo is clonable and runnable
-with no database to configure. Pointing it at a live PostgreSQL target is a
-command line flag (`--target-kind postgres`); the check SQL is identical either
-way.
+The target is a DuckDB file by default so the repo is clonable and runnable with
+no database to configure. Pointing it at a live PostgreSQL target is a command
+line flag; the check SQL is identical either way.
 
 ---
 
@@ -56,20 +55,33 @@ python -m seed.build_demo
 python -m validator
 ```
 
-Expected output — the tool finding the defects that were planted:
+The demo target is deliberately broken, so the tool should reject it:
 
 ```
 STATUS   TABLE          CHECK                            DETAIL
 ------------------------------------------------------------------------------
-FAIL     landlords      row_count_reconciliation         3 UNEXPECTED extra rows in target
-FAIL     properties     row_count_reconciliation         2 rows MISSING from target
-PASS     properties     orphaned_fk[landlord_id->landlords] all landlord_id values resolve
-PASS     tenancies      row_count_reconciliation         350 rows in source and target
-FAIL     tenancies      orphaned_fk[property_id->properties] 7 rows reference a properties that does not exist
-FAIL     payments       row_count_reconciliation         12 rows MISSING from target
+FAIL     landlords      row_count_reconciliation         3 UNEXPECTED extra rows in target (source 150, target 153)
+PASS     landlords      primary_key_integrity            landlord_id is unique and non-null
+WARN     landlords      duplicate_business_keys          3 entities appear more than once on (email), affecting 6 rows
+FAIL     landlords      null_rate_drift[phone]           phone is emptier after migration: 0.0% null in source, 39.2% in target
+FAIL     landlords      value_level_diff                 60 values differ between source and target (150 of 150 source rows compared in full)
+FAIL     properties     row_count_reconciliation         2 rows MISSING from target (source 300, target 298)
+FAIL     properties     primary_key_integrity            2 duplicate property_id values affecting 4 rows
+PASS     properties     orphaned_fk[landlord_id->landlords] all landlord_id values resolve to a landlords row
+WARN     properties     duplicate_business_keys          2 entities appear more than once on (postcode + address_line1), affecting 4 rows
+...
+FAIL     tenancies      orphaned_fk[property_id->properties] 7 rows reference a properties that does not exist in the target
+FAIL     payments       row_count_reconciliation         12 rows MISSING from target (source 1,500, target 1,488)
+FAIL     payments       value_level_diff                 7 values differ between source and target (1,488 of 1,500 source rows compared in full)
+------------------------------------------------------------------------------
 
+RESULT: 13 passed, 8 failed, 2 warnings, 0 errors
 VERDICT: REJECT -- blocking defects found. Do not deploy.
 ```
+
+Every failure is followed by an evidence block listing example offending rows,
+so a reader can go and look at real records rather than take the tool's word
+for it.
 
 To confirm the validator isn't inventing problems, build a faithful target and
 run it again:
@@ -83,15 +95,39 @@ Because the clean target is built *from* the source CSVs, the two sides are
 identical by construction — so any finding on a `--clean` run is a bug in the
 validator, not in the data. That makes it a genuine self-test.
 
-The exit code is `0` on approve and `1` on reject, so this can run in CI as a
-gate on a migration pull request rather than as something someone has to
-remember to look at.
+---
+
+## Running it against a real migration
+
+```bash
+python -m validator \
+  --source /exports/agency-name/2026-08-04/ \
+  --target "postgresql://readonly_user@db-host:5432/staging_db" \
+  --target-kind postgres
+```
+
+Connect as a database user granted only `SELECT`. The tool never issues a write,
+but the credential should enforce that rather than relying on the application to
+behave — defence at the database level is stronger than defence in code.
+
+The exit code is `0` on approve and `1` on reject, so this runs as a gate rather
+than as something someone has to remember to look at:
+
+```yaml
+- name: Validate migration
+  run: |
+    python -m validator --source "$EXPORT_DIR" --target "$STAGING_DSN" \
+      --target-kind postgres --markdown > report.md
+```
+
+The step fails on rejection and `report.md` can be posted as a pull request
+comment. That is what `--markdown` is for.
 
 ---
 
 ## The checks
 
-| # | Check | Shape | Catches | Status |
+| # | Check | Shape | Catches | On failure |
 |---|---|---|---|---|
 | 1 | Row count reconciliation | aggregate comparison | wholesale row loss or duplication | FAIL |
 | 2 | Primary key integrity | window functions | duplicated or null technical keys | FAIL |
@@ -108,13 +144,21 @@ around that, which is why adding a new one is short. All of the SQL lives in
 Check 4 reports WARN rather than FAIL by design: it is a heuristic, and a false
 positive that blocks a release is expensive. It surfaces candidates for a human
 to judge rather than stopping the migration on the tool's own authority. Note
-the consequence — a WARN does not affect the exit code, so this check alone
-will not fail a CI gate.
+the consequence — a WARN does not affect the exit code, so this check alone will
+not fail a CI gate.
+
+### Why checks 2 and 4 are separate
+
+Check 2 catches the same primary key appearing twice. Check 4 catches the same
+*landlord* appearing twice, under two different primary keys. The second table
+is technically valid — and completely wrong. In a roll-up, where the same
+landlord may exist in three acquired CRMs, deduplicating on a business key is
+the whole problem.
 
 ### Verifying it against known defects
 
 `seed/build_demo.py` injects six specific defects, listed there in plain SQL.
-Each maps to exactly one check, so a broken run should catch all six:
+Each maps to a check, so a broken run should catch all six:
 
 | Defect | Caught by |
 |---|---|
@@ -130,26 +174,29 @@ often the column is populated, and as 60 specific rows whose phone number
 changed. Two checks agreeing on a defect from different directions is a useful
 property, not double-counting.
 
-### Why 3 and 4 are separate
-
-Check 3 catches the same primary key twice. Check 4 catches the same *landlord*
-twice, under two different primary keys. The second table is technically
-valid — and completely wrong. In a roll-up, where the same landlord may exist
-in three acquired CRMs, deduplicating on a business key is the whole problem.
-
 ---
 
 ## Known limitations
 
+- **The migration spec is hardcoded.** `config.py` declares one schema —
+  landlords, properties, tenancies, payments. Real use would need the spec
+  loaded per source system, since every acquired agency exports a different
+  shape. The change is small (`MIGRATION_SPEC` becomes a parsed YAML file behind
+  a `--spec` flag) but it has not been made, and until it is, validating a
+  second migration means editing Python.
 - **Row count reconciliation cannot see offsetting errors.** A migration that
   loses two rows and duplicates two others reconciles perfectly. That is
-  inherent to comparing totals, not a bug — it is why checks 3 and 4 exist. The
-  limitation is asserted as a passing test in `tests/test_checks.py` so that
-  nobody reads a green row count and concludes the migration is sound.
+  inherent to comparing totals, not a bug — it is why checks 2 and 4 exist. The
+  limitation is asserted as a passing test in `tests/test_checks.py` so nobody
+  reads a green row count and concludes the migration is sound.
 - **Value-level diff can be sampled** rather than exhaustive on large tables,
   controlled by `VALUE_DIFF_SAMPLE_SIZE`. The report always states which was
-  done — "no differences found" means something very different after a full
-  scan than after sampling 500 rows out of two million.
+  done, and how many rows were actually compared — "no differences found" means
+  something very different after a full scan than after sampling 500 rows out of
+  two million.
+- **Value-level diff only compares rows present on both sides.** Rows missing
+  from the target are check 1's finding, not this one's; a row that never
+  arrived is never compared.
 - **Float comparison uses a tolerance** (`FLOAT_COMPARISON_TOLERANCE`), because
   exact equality on floating point reports representation artefacts as defects.
   A genuine difference smaller than the tolerance will not be reported.
@@ -157,10 +204,13 @@ in three acquired CRMs, deduplicating on a business key is the whole problem.
   match on the configured key, after normalising case and whitespace. It cannot
   find the same landlord recorded under two different email addresses.
 - **Null rate drift needs volume to be meaningful.** On a small table a single
-  null can exceed the tolerance, so the threshold is better suited to tables of
-  a few hundred rows and up.
-- **Demo data is synthetic.** The schema models a UK lettings CRM migration
-  (landlords → properties → tenancies → payments) but is generated, not real.
+  null can exceed the tolerance, so the threshold suits tables of a few hundred
+  rows and up.
+- **No incremental or delta support.** Each run compares a full export against a
+  full target. Validating an ongoing sync rather than a one-off migration would
+  need a different approach.
+- **Demo data is synthetic.** The schema models a UK lettings CRM migration but
+  is generated, not real.
 
 ---
 
@@ -170,13 +220,13 @@ in three acquired CRMs, deduplicating on a business key is the whole problem.
 validator/
   config.py    what is being validated — tables, keys, relationships
   engine.py    DuckDB setup; registers src_/tgt_ views
-  checks.py    the checks themselves
+  checks.py    the checks, and all of the SQL
   report.py    result objects and report rendering
   cli.py       command line entry point
 seed/
-  build_demo.py  generates source CSVs and a target DB, with defects listed in plain SQL
+  build_demo.py  generates source CSVs and a target DB, with defects in plain SQL
 tests/
-  test_checks.py  each check tested against a migration whose defects are known in advance
+  test_checks.py  each check tested against a migration whose defects are known
 ```
 
 `config.py` is the file to read first. It declares the entire shape of the
@@ -197,6 +247,9 @@ asserts the check finds precisely that. A validation tool has to be tested
 against data whose defects are known in advance — otherwise you are trusting it
 to tell you the truth about data you cannot independently verify, which is the
 position it exists to get you out of.
+
+Nothing is mocked: the tests write real CSVs and build a real database, so the
+SQL itself is exercised rather than the Python around it.
 
 ---
 
