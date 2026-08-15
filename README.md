@@ -70,7 +70,7 @@ FAIL     properties     primary_key_integrity            2 duplicate property_id
 PASS     properties     orphaned_fk[landlord_id->landlords] all landlord_id values resolve to a landlords row
 WARN     properties     duplicate_business_keys          2 entities appear more than once on (postcode + address_line1), affecting 4 rows
 ...
-FAIL     tenancies      orphaned_fk[property_id->properties] 7 rows reference a properties that does not exist in the target
+FAIL     tenancies      orphaned_fk[property_id->properties] 7 rows reference a properties row that does not exist in the target
 FAIL     payments       row_count_reconciliation         12 rows MISSING from target (source 1,500, target 1,488)
 FAIL     payments       value_level_diff                 7 values differ between source and target (1,488 of 1,500 source rows compared in full)
 ------------------------------------------------------------------------------
@@ -139,7 +139,9 @@ comment. That is what `--markdown` is for.
 Reconciliation SQL is almost always one of three shapes — an aggregate
 comparison, an anti-join, or a partition-and-count. The checks are organised
 around that, which is why adding a new one is short. All of the SQL lives in
-`validator/checks.py`, alongside the reasoning for each query.
+`validator/checks.py`, alongside the reasoning for each query. The numbering
+above follows `CHECK_REGISTRY` in that file, which is the order the report
+prints in and the authority if anything ever disagrees.
 
 Check 4 reports WARN rather than FAIL by design: it is a heuristic, and a false
 positive that blocks a release is expensive. It surfaces candidates for a human
@@ -174,6 +176,22 @@ often the column is populated, and as 60 specific rows whose phone number
 changed. Two checks agreeing on a defect from different directions is a useful
 property, not double-counting.
 
+#### Read the properties row count carefully
+
+D2 and D3 both land on `properties`. Four rows are deleted and two are inserted
+twice, so the totals net to 300 → 298 and the report says **"2 rows MISSING"**.
+That figure is arithmetically correct and practically misleading: four rows
+were lost.
+
+This is not a bug, and it is not a coincidence either — it is the offsetting-error
+limitation below, occurring in the demo rather than only in a fixture. It is
+also why the checks are layered. The row count nets to a wrong-looking number,
+and then check 2 reports the two duplicated `property_id` values, and check 3
+reports seven tenancies referencing properties that never arrived. No single
+check describes the damage; three of them together do.
+
+If you only ever run a row count, this is the shape of the thing you will miss.
+
 ---
 
 ## Known limitations
@@ -188,7 +206,16 @@ property, not double-counting.
   loses two rows and duplicates two others reconciles perfectly. That is
   inherent to comparing totals, not a bug — it is why checks 2 and 4 exist. The
   limitation is asserted as a passing test in `tests/test_checks.py` so nobody
-  reads a green row count and concludes the migration is sound.
+  reads a green row count and concludes the migration is sound, and it is
+  visible in the demo output on the `properties` table.
+- **`rows_compared` in the value diff counts join output rows, not distinct
+  source rows.** When the target contains duplicate primary keys the join fans
+  out: in the demo, `properties` reports "298 of 300 source rows compared" when
+  296 distinct source rows actually matched, because the two duplicated
+  `property_id` values each join twice. The verdict is unaffected and the
+  duplication is never hidden — check 2 fails on the same table in the same
+  report — but the label overstates coverage. `COUNT(DISTINCT s.<pk>)` would be
+  the honest figure.
 - **Value-level diff can be sampled** rather than exhaustive on large tables,
   controlled by `VALUE_DIFF_SAMPLE_SIZE`. The report always states which was
   done, and how many rows were actually compared — "no differences found" means
@@ -209,6 +236,11 @@ property, not double-counting.
 - **No incremental or delta support.** Each run compares a full export against a
   full target. Validating an ongoing sync rather than a one-off migration would
   need a different approach.
+- **The PostgreSQL target path is untested end to end.** `--target-kind postgres`
+  is implemented and the check SQL is identical either way, but every run to date
+  has been against a DuckDB target. Schema qualification and identifier casing
+  are the two things most likely to need adjusting on first contact with a real
+  instance.
 - **Demo data is synthetic.** The schema models a UK lettings CRM migration but
   is generated, not real.
 
@@ -230,9 +262,11 @@ tests/
 ```
 
 `config.py` is the file to read first. It declares the entire shape of the
-migration — which tables move, what identifies a row, how tables relate —
+migration — which tables move, what identifies a row, how the tables relate —
 without any check logic. Adding a table to the validation run means adding one
-entry there.
+entry there. Every field it declares is read by at least one check: a
+declared-but-unenforced field is worse than no field, because it reads as
+coverage that does not exist.
 
 ---
 
@@ -242,11 +276,28 @@ entry there.
 pytest -v
 ```
 
+24 tests, four to five per check rather than one each. Every check gets a clean
+case proving it does not invent problems, a planted-defect case proving it
+catches what it exists for, and the edge cases around it — a NULL foreign key is
+not an orphan, drift inside the tolerance should not fire, float representation
+noise is not a defect.
+
 Each test builds a miniature migration by hand with one specific defect, then
 asserts the check finds precisely that. A validation tool has to be tested
 against data whose defects are known in advance — otherwise you are trusting it
 to tell you the truth about data you cannot independently verify, which is the
 position it exists to get you out of.
+
+Some of the tests exist to freeze a decision rather than to cover a branch:
+
+- `test_value_diff_detects_value_that_became_null` fails the moment anyone
+  replaces `IS DISTINCT FROM` with `!=`, which would silently skip every row
+  where exactly one side is NULL.
+- `test_business_keys_normalise_case_and_whitespace` forces a conversation
+  before anyone removes the `LOWER(TRIM(...))` normalisation.
+- `test_row_counts_cannot_see_offsetting_errors` asserts a **PASS** against a
+  target that is demonstrably wrong — the limitation written down as executable
+  text rather than as a bullet nobody reads.
 
 Nothing is mocked: the tests write real CSVs and build a real database, so the
 SQL itself is exercised rather than the Python around it.
