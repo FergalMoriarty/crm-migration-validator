@@ -15,6 +15,9 @@ Every test follows the same three steps:
     ACT      run one check against it
     ASSERT   confirm the check found precisely that thing
 
+The sections below follow CHECK_REGISTRY in checks.py, which is the order the
+report prints in.
+
 The fixtures use landlords, properties and payments rather than abstract tables,
 so the tests read in the same language as the rest of the repo. They are defined
 locally rather than imported from config.py, so that changing the production
@@ -229,7 +232,7 @@ def test_row_counts_cannot_see_offsetting_errors(tmp_path):
 
     If a migration loses 2 rows and duplicates 2 others, the totals match and
     this check passes. That is inherent to comparing aggregates, not a bug --
-    but it IS a limitation, and it is why check 3 exists.
+    but it IS a limitation, and it is why check 2 exists.
 
     Writing the limitation down as a passing test means nobody later reads a
     green row count and concludes the migration is sound.
@@ -245,11 +248,86 @@ def test_row_counts_cannot_see_offsetting_errors(tmp_path):
         result = check_row_counts(engine, LANDLORD_SPEC)
 
     assert result.status is Status.PASS          # totals reconcile...
-    # ...even though the target is demonstrably wrong. Hence check 3, below.
+    # ...even though the target is demonstrably wrong. Hence check 2, below.
 
 
 # ===========================================================================
-# CHECK 2 -- orphaned foreign keys
+# CHECK 2 -- primary key integrity
+# ===========================================================================
+
+def test_primary_key_integrity_passes_when_sound(tmp_path):
+    rows = [landlord(i) for i in range(1, 6)]
+    source_dir, target_db = build_scenario(
+        tmp_path, source={"landlords": rows}, target={"landlords": rows}
+    )
+
+    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
+        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
+
+    assert result.status is Status.PASS
+    assert result.metrics["duplicate_keys"] == 0
+    assert result.metrics["null_keys"] == 0
+
+
+def test_primary_key_integrity_detects_duplicates(tmp_path):
+    """
+    Catches the case row counts cannot: the same key appearing more than once.
+
+    Note the two distinct numbers. Landlord 1 appears three times and landlord 2
+    twice, so there are 2 duplicated KEYS affecting 5 ROWS. Reporting only one of
+    those figures tells the reader either how widespread the problem is or how
+    much data it touches, but not both.
+    """
+    source_rows = [landlord(i) for i in range(1, 4)]
+    target_rows = [
+        landlord(1), landlord(1), landlord(1),   # key 1 three times
+        landlord(2), landlord(2),                # key 2 twice
+        landlord(3),
+    ]
+
+    source_dir, target_db = build_scenario(
+        tmp_path, source={"landlords": source_rows}, target={"landlords": target_rows}
+    )
+
+    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
+        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
+
+    assert result.status is Status.FAIL
+    assert result.metrics["duplicate_keys"] == 2
+    assert result.metrics["rows_affected_by_duplicates"] == 5
+    # Most duplicated key is reported first, so the worst case is at the top.
+    assert result.offenders.iloc[0]["duplicate_pk"] == 1
+    assert result.offenders.iloc[0]["occurrences"] == 3
+
+
+def test_primary_key_integrity_detects_nulls(tmp_path):
+    """
+    A null primary key identifies nothing and is its own defect.
+
+    Worth a separate branch because the duplicate query filters nulls out --
+    PARTITION BY groups all nulls together, so a single null key would never
+    appear as a duplicate and would go unreported without it.
+    """
+    source_rows = [landlord(1), landlord(2)]
+    target_rows = [
+        landlord(1),
+        {"landlord_id": None, "email": "x@example.com", "phone": "07700900000"},
+    ]
+
+    source_dir, target_db = build_scenario(
+        tmp_path, source={"landlords": source_rows}, target={"landlords": target_rows}
+    )
+
+    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
+        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
+
+    assert result.status is Status.FAIL
+    assert result.metrics["null_keys"] == 1
+    assert "null" in result.summary.lower()
+
+
+# ===========================================================================
+# CHECK 3 -- orphaned foreign keys
 # ===========================================================================
 
 def test_orphaned_fk_passes_when_all_parents_present(tmp_path):
@@ -340,81 +418,6 @@ def test_table_with_no_foreign_keys_returns_nothing(tmp_path):
 
 
 # ===========================================================================
-# CHECK 3 -- primary key integrity
-# ===========================================================================
-
-def test_primary_key_integrity_passes_when_sound(tmp_path):
-    rows = [landlord(i) for i in range(1, 6)]
-    source_dir, target_db = build_scenario(
-        tmp_path, source={"landlords": rows}, target={"landlords": rows}
-    )
-
-    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
-        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
-
-    assert result.status is Status.PASS
-    assert result.metrics["duplicate_keys"] == 0
-    assert result.metrics["null_keys"] == 0
-
-
-def test_primary_key_integrity_detects_duplicates(tmp_path):
-    """
-    Catches the case row counts cannot: the same key appearing more than once.
-
-    Note the two distinct numbers. Landlord 1 appears three times and landlord 2
-    twice, so there are 2 duplicated KEYS affecting 5 ROWS. Reporting only one of
-    those figures tells the reader either how widespread the problem is or how
-    much data it touches, but not both.
-    """
-    source_rows = [landlord(i) for i in range(1, 4)]
-    target_rows = [
-        landlord(1), landlord(1), landlord(1),   # key 1 three times
-        landlord(2), landlord(2),                # key 2 twice
-        landlord(3),
-    ]
-
-    source_dir, target_db = build_scenario(
-        tmp_path, source={"landlords": source_rows}, target={"landlords": target_rows}
-    )
-
-    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
-        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
-
-    assert result.status is Status.FAIL
-    assert result.metrics["duplicate_keys"] == 2
-    assert result.metrics["rows_affected_by_duplicates"] == 5
-    # Most duplicated key is reported first, so the worst case is at the top.
-    assert result.offenders.iloc[0]["duplicate_pk"] == 1
-    assert result.offenders.iloc[0]["occurrences"] == 3
-
-
-def test_primary_key_integrity_detects_nulls(tmp_path):
-    """
-    A null primary key identifies nothing and is its own defect.
-
-    Worth a separate branch because the duplicate query filters nulls out --
-    PARTITION BY groups all nulls together, so a single null key would never
-    appear as a duplicate and would go unreported without it.
-    """
-    source_rows = [landlord(1), landlord(2)]
-    target_rows = [
-        landlord(1),
-        {"landlord_id": None, "email": "x@example.com", "phone": "07700900000"},
-    ]
-
-    source_dir, target_db = build_scenario(
-        tmp_path, source={"landlords": source_rows}, target={"landlords": target_rows}
-    )
-
-    with ValidationEngine(source_dir, str(target_db), spec=[LANDLORD_SPEC]) as engine:
-        result = check_primary_key_integrity(engine, LANDLORD_SPEC)
-
-    assert result.status is Status.FAIL
-    assert result.metrics["null_keys"] == 1
-    assert "null" in result.summary.lower()
-
-
-# ===========================================================================
 # CHECK 4 -- duplicate business keys
 # ===========================================================================
 
@@ -434,7 +437,7 @@ def test_business_keys_detect_same_entity_under_two_ids(tmp_path):
     """
     The defining roll-up defect: one landlord, two records.
 
-    The primary keys are perfectly unique, so check 3 passes. Only a business
+    The primary keys are perfectly unique, so check 2 passes. Only a business
     key comparison catches it -- which is why both checks exist.
     """
     source_rows = [landlord(1, email="jane@example.com"),
@@ -686,7 +689,7 @@ def test_value_diff_tolerates_float_representation_noise(tmp_path):
 
 def test_value_diff_only_compares_rows_present_on_both_sides(tmp_path):
     """
-    Rows missing from the target are check 1's job, not this one.
+    Rows missing from the target are check 1's job, not this one's.
 
     The inner join means a row that never arrived simply is not compared.
     Keeping the concerns separate is what lets the report say '12 rows missing'

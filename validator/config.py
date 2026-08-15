@@ -41,20 +41,22 @@ class TableSpec:
     target_table  -- the table in the Dwelly database (the 'after' picture)
     primary_key   -- the technical key. Must be unique and non-null in the target.
     business_key  -- the columns that identify a real-world entity.
+    foreign_keys  -- relationships that must still resolve after migration.
 
     The distinction between primary_key and business_key matters a lot in a
     roll-up. Two rows can have different primary keys (because the migration
     tool assigned new IDs) while describing the SAME landlord. The primary key
     check will pass; only a business key check catches the duplicate.
 
-    required_columns -- columns that should never be null after migration.
+    Every field here is read by at least one check. A declared-but-unenforced
+    field is worse than no field at all: it reads as coverage that does not
+    exist.
     """
     name: str
     source_csv: str
     target_table: str
     primary_key: str
     business_key: list[str] = field(default_factory=list)
-    required_columns: list[str] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
 
 
@@ -76,7 +78,6 @@ MIGRATION_SPEC: list[TableSpec] = [
         # under two different landlord_ids, the migration created a duplicate
         # person -- they will get two sets of statements and two logins.
         business_key=["email"],
-        required_columns=["email", "last_name"],
         foreign_keys=[],
     ),
     TableSpec(
@@ -86,7 +87,6 @@ MIGRATION_SPEC: list[TableSpec] = [
         primary_key="property_id",
         # A physical address identifies a property.
         business_key=["postcode", "address_line1"],
-        required_columns=["postcode", "landlord_id"],
         foreign_keys=[
             ForeignKey("landlord_id", "landlords", "landlord_id"),
         ],
@@ -98,7 +98,6 @@ MIGRATION_SPEC: list[TableSpec] = [
         primary_key="tenancy_id",
         # One property can only have one tenancy starting on a given date.
         business_key=["property_id", "start_date"],
-        required_columns=["property_id", "start_date", "rent_amount"],
         foreign_keys=[
             ForeignKey("property_id", "properties", "property_id"),
         ],
@@ -109,7 +108,6 @@ MIGRATION_SPEC: list[TableSpec] = [
         target_table="payments",
         primary_key="payment_id",
         business_key=["tenancy_id", "payment_date", "amount"],
-        required_columns=["tenancy_id", "payment_date", "amount"],
         foreign_keys=[
             ForeignKey("tenancy_id", "tenancies", "tenancy_id"),
         ],

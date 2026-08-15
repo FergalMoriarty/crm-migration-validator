@@ -15,6 +15,9 @@ Checks are registered in CHECK_REGISTRY at the bottom of this file. The runner
 iterates the registry, so adding a check means writing a function and adding
 one line to the list -- nothing else in the codebase needs to know about it.
 
+The section numbers below match CHECK_REGISTRY, which is the order the report
+prints in. If the two ever disagree, the registry is the authority.
+
 --------------------------------------------------------------------------
 A NOTE ON WHY THE SQL LOOKS THE WAY IT DOES
 --------------------------------------------------------------------------
@@ -28,7 +31,7 @@ Reconciliation SQL is mostly one of three shapes:
      of migration validation: missing rows, orphaned references, unmatched
      keys are all anti-joins.
 
-  3. GROUP BY ... HAVING -- find keys that occur more often than they should.
+  3. PARTITION AND COUNT -- find keys that occur more often than they should.
      This is how duplicates are caught.
 
 Almost every check below is one of those three.
@@ -53,7 +56,7 @@ EVIDENCE_LIMIT = 50
 
 
 # ===========================================================================
-# CHECK 1 -- ROW COUNT RECONCILIATION                          [WORKED EXAMPLE]
+# CHECK 1 -- ROW COUNT RECONCILIATION
 # ===========================================================================
 
 def check_row_counts(engine: ValidationEngine, table: TableSpec) -> CheckResult:
@@ -69,7 +72,7 @@ def check_row_counts(engine: ValidationEngine, table: TableSpec) -> CheckResult:
 
     Note what this check does NOT tell you: it compares two totals, so it
     cannot distinguish "12 rows lost" from "20 lost and 8 spuriously created".
-    That is what the primary key checks are for. Cheap checks narrow the
+    That is what the primary key check is for. Cheap checks narrow the
     problem; they do not diagnose it.
     """
     source_rows = engine.scalar(f"SELECT COUNT(*) FROM src_{table.name}")
@@ -114,104 +117,7 @@ def check_row_counts(engine: ValidationEngine, table: TableSpec) -> CheckResult:
 
 
 # ===========================================================================
-# CHECK 2 -- ORPHANED FOREIGN KEYS                             [WORKED EXAMPLE]
-# ===========================================================================
-
-def check_orphaned_foreign_keys(
-    engine: ValidationEngine, table: TableSpec
-) -> list[CheckResult]:
-    """
-    Does every foreign key in the target point at a row that actually exists?
-
-    This is the check that catches the migration defect users notice first. A
-    tenancy row survives, but the property it belongs to did not migrate, so
-    the tenancy references a property_id that isn't there. Nothing errors. The
-    row count might even reconcile. But open that tenancy in the application
-    and the property details are blank.
-
-    Shape: ANTI-JOIN. We look for child rows whose parent is absent.
-
-    Returns a list because one table can have several foreign keys, and each
-    deserves its own line in the report -- knowing that 'tenancies has 5 broken
-    references' is much less useful than knowing which relationship broke.
-    """
-    results: list[CheckResult] = []
-
-    if not table.foreign_keys:
-        return results
-
-    for fk in table.foreign_keys:
-        results.append(_check_single_fk(engine, table, fk))
-
-    return results
-
-
-def _check_single_fk(
-    engine: ValidationEngine, table: TableSpec, fk: ForeignKey
-) -> CheckResult:
-    """Run the anti-join for one specific foreign key relationship."""
-
-    check_name = f"orphaned_fk[{fk.column}->{fk.parent_table}]"
-
-    # The anti-join.
-    #
-    # LEFT JOIN keeps every child row, matched or not. Rows where the parent
-    # side came back NULL are the ones with no matching parent -- the orphans.
-    #
-    # The `child.{fk.column} IS NOT NULL` filter matters: a NULL foreign key
-    # is a *different* defect (a missing link, caught by the required-columns
-    # check) and lumping the two together makes both harder to diagnose. A
-    # NULL will always fail to join, so without this filter every NULL would
-    # be miscounted as an orphan.
-    count_sql = f"""
-        SELECT COUNT(*)
-        FROM tgt_{table.name}      AS child
-        LEFT JOIN tgt_{fk.parent_table} AS parent
-               ON child.{fk.column} = parent.{fk.parent_column}
-        WHERE parent.{fk.parent_column} IS NULL
-          AND child.{fk.column} IS NOT NULL
-    """
-    orphan_count = engine.scalar(count_sql)
-
-    if orphan_count == 0:
-        return CheckResult(
-            check=check_name,
-            table=table.name,
-            status=Status.PASS,
-            summary=f"all {fk.column} values resolve to a {fk.parent_table} row",
-        )
-
-    # Pull back examples. Note we select the child's own primary key too, so
-    # whoever reads the report can go straight to the offending records.
-    evidence_sql = f"""
-        SELECT child.{table.primary_key},
-               child.{fk.column} AS missing_{fk.parent_column}
-        FROM tgt_{table.name}      AS child
-        LEFT JOIN tgt_{fk.parent_table} AS parent
-               ON child.{fk.column} = parent.{fk.parent_column}
-        WHERE parent.{fk.parent_column} IS NULL
-          AND child.{fk.column} IS NOT NULL
-        ORDER BY child.{table.primary_key}
-        LIMIT {EVIDENCE_LIMIT}
-    """
-    offenders = engine.query(evidence_sql)
-
-    return CheckResult(
-        check=check_name,
-        table=table.name,
-        status=Status.FAIL,
-        summary=(
-            f"{orphan_count:,} rows reference a {fk.parent_table} row "
-            f"that does not exist in the target"
-        ),
-        offenders=offenders,
-        offender_count=orphan_count,
-        metrics={"orphaned_rows": orphan_count},
-    )
-
-
-# ===========================================================================
-# CHECK 3 -- PRIMARY KEY INTEGRITY                                  [YOUR TURN]
+# CHECK 2 -- PRIMARY KEY INTEGRITY
 # ===========================================================================
 
 def check_primary_key_integrity(
@@ -226,36 +132,35 @@ def check_primary_key_integrity(
     silently multiplies row counts downstream -- a payments join against a
     duplicated tenancy will double the reported rent collected.
 
-    SHAPE: GROUP BY ... HAVING, plus a null count.
+    This is also the check that catches what check 1 structurally cannot: a
+    migration that loses two rows and duplicates two others reconciles
+    perfectly on totals.
 
-    SKETCH -- duplicates:
-        SELECT {pk}, COUNT(*) AS occurrences
-        FROM tgt_{table}
-        GROUP BY {pk}
-        HAVING COUNT(*) > 1
+    SHAPE: PARTITION AND COUNT, plus a null count.
 
-    SKETCH -- nulls:
-        SELECT COUNT(*) FROM tgt_{table} WHERE {pk} IS NULL
+    DECISIONS TAKEN, AND WHY
 
-    IMPLEMENTATION NOTES
+    1. Duplicates and nulls are reported as ONE result rather than two. Both
+       are failures of the same property -- "this column identifies exactly one
+       row" -- and splitting them doubles the length of the report without
+       telling the reader anything they could act on separately.
 
-    Duplicates and nulls are reported as ONE result rather than two. Both are
-    failures of the same property -- "this column identifies exactly one row" --
-    and splitting them doubles the length of the report without telling the
-    reader anything they could act on separately.
+    2. The summary carries two numbers, not one: how many keys are duplicated,
+       and how many rows that affects. "3 duplicate keys" and "3 duplicate keys
+       affecting 47 rows" are very different situations to walk into.
 
-    The summary carries two numbers, not one: how many keys are duplicated, and
-    how many rows that affects. "3 duplicate keys" and "3 duplicate keys
-    affecting 47 rows" are very different situations to walk into.
+    3. The null count is computed separately from the duplicate query, because
+       PARTITION BY groups all nulls into one partition. A single null key
+       would therefore never appear as a duplicate and would go unreported.
 
-    A note on the window function: COUNT(*) OVER (PARTITION BY pk) deliberately
-    has NO ORDER BY. Adding one changes the default frame to
-    RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, which turns the whole
-    partition total into a running count. Here it would happen to give the right
-    answer -- ordering by the partition column makes every row a peer, and RANGE
-    frames include peers -- but it would silently under-report the moment the
-    ORDER BY column differed from the PARTITION BY column. An unordered window
-    is the whole-partition aggregate we actually want.
+    4. COUNT(*) OVER (PARTITION BY pk) deliberately has NO ORDER BY. Adding one
+       changes the default frame to RANGE BETWEEN UNBOUNDED PRECEDING AND
+       CURRENT ROW, which turns the whole-partition total into a running count.
+       Here it would happen to give the right answer -- ordering by the
+       partition column makes every row a peer, and RANGE frames include peers
+       -- but it would silently under-report the moment the ORDER BY column
+       differed from the PARTITION BY column. An unordered window is the
+       whole-partition aggregate we actually want.
     """
     pk = table.primary_key
     view = f"tgt_{table.name}"
@@ -322,7 +227,107 @@ def check_primary_key_integrity(
 
 
 # ===========================================================================
-# CHECK 4 -- DUPLICATE BUSINESS KEYS                                [YOUR TURN]
+# CHECK 3 -- ORPHANED FOREIGN KEYS
+# ===========================================================================
+
+def check_orphaned_foreign_keys(
+    engine: ValidationEngine, table: TableSpec
+) -> list[CheckResult]:
+    """
+    Does every foreign key in the target point at a row that actually exists?
+
+    This is the check that catches the migration defect users notice first. A
+    tenancy row survives, but the property it belongs to did not migrate, so
+    the tenancy references a property_id that isn't there. Nothing errors. The
+    row count might even reconcile. But open that tenancy in the application
+    and the property details are blank.
+
+    Shape: ANTI-JOIN. We look for child rows whose parent is absent.
+
+    Returns a list because one table can have several foreign keys, and each
+    deserves its own line in the report -- knowing that 'tenancies has 5 broken
+    references' is much less useful than knowing which relationship broke.
+    """
+    results: list[CheckResult] = []
+
+    if not table.foreign_keys:
+        return results
+
+    for fk in table.foreign_keys:
+        results.append(_check_single_fk(engine, table, fk))
+
+    return results
+
+
+def _check_single_fk(
+    engine: ValidationEngine, table: TableSpec, fk: ForeignKey
+) -> CheckResult:
+    """Run the anti-join for one specific foreign key relationship."""
+
+    check_name = f"orphaned_fk[{fk.column}->{fk.parent_table}]"
+
+    # The anti-join.
+    #
+    # LEFT JOIN keeps every child row, matched or not. Rows where the parent
+    # side came back NULL are the ones with no matching parent -- the orphans.
+    #
+    # The `child.{fk.column} IS NOT NULL` filter matters: a NULL foreign key is
+    # a *different* defect. It means the link was never recorded, rather than
+    # recorded and then broken by the migration, and the two have different
+    # causes and different fixes. A NULL will always fail to join, so without
+    # this filter every NULL would be miscounted as an orphan -- inflating the
+    # count and pointing engineers at the wrong problem. Null links surface
+    # instead through the null-rate drift check, which will show the column
+    # arriving emptier than it left.
+    count_sql = f"""
+        SELECT COUNT(*)
+        FROM tgt_{table.name}      AS child
+        LEFT JOIN tgt_{fk.parent_table} AS parent
+               ON child.{fk.column} = parent.{fk.parent_column}
+        WHERE parent.{fk.parent_column} IS NULL
+          AND child.{fk.column} IS NOT NULL
+    """
+    orphan_count = engine.scalar(count_sql)
+
+    if orphan_count == 0:
+        return CheckResult(
+            check=check_name,
+            table=table.name,
+            status=Status.PASS,
+            summary=f"all {fk.column} values resolve to a {fk.parent_table} row",
+        )
+
+    # Pull back examples. Note we select the child's own primary key too, so
+    # whoever reads the report can go straight to the offending records.
+    evidence_sql = f"""
+        SELECT child.{table.primary_key},
+               child.{fk.column} AS missing_{fk.parent_column}
+        FROM tgt_{table.name}      AS child
+        LEFT JOIN tgt_{fk.parent_table} AS parent
+               ON child.{fk.column} = parent.{fk.parent_column}
+        WHERE parent.{fk.parent_column} IS NULL
+          AND child.{fk.column} IS NOT NULL
+        ORDER BY child.{table.primary_key}
+        LIMIT {EVIDENCE_LIMIT}
+    """
+    offenders = engine.query(evidence_sql)
+
+    return CheckResult(
+        check=check_name,
+        table=table.name,
+        status=Status.FAIL,
+        summary=(
+            f"{orphan_count:,} rows reference a {fk.parent_table} row "
+            f"that does not exist in the target"
+        ),
+        offenders=offenders,
+        offender_count=orphan_count,
+        metrics={"orphaned_rows": orphan_count},
+    )
+
+
+# ===========================================================================
+# CHECK 4 -- DUPLICATE BUSINESS KEYS
 # ===========================================================================
 
 def check_duplicate_business_keys(
@@ -331,8 +336,8 @@ def check_duplicate_business_keys(
     """
     Does the same real-world entity appear more than once under different IDs?
 
-    WHY IT MATTERS -- AND WHY IT IS DIFFERENT FROM CHECK 3
-    Check 3 catches the same primary key twice. This catches the same *person*
+    WHY IT MATTERS -- AND WHY IT IS DIFFERENT FROM CHECK 2
+    Check 2 catches the same primary key twice. This catches the same *person*
     twice under two different primary keys. Technically the table is perfectly
     valid; in reality one landlord now has two records, two statements, and
     two logins.
@@ -341,13 +346,7 @@ def check_duplicate_business_keys(
     after agency: the same landlord exists in three CRMs, and unless the
     migration deduplicates on a business key they arrive as three landlords.
 
-    SHAPE: GROUP BY ... HAVING, on business_key rather than primary_key.
-
-    SKETCH:
-        SELECT {business_key_cols}, COUNT(*) AS occurrences
-        FROM tgt_{table}
-        GROUP BY {business_key_cols}
-        HAVING COUNT(*) > 1
+    SHAPE: PARTITION AND COUNT, on business_key rather than primary_key.
 
     DECISIONS TAKEN, AND WHY
 
@@ -448,7 +447,7 @@ def check_duplicate_business_keys(
 
 
 # ===========================================================================
-# CHECK 5 -- NULL RATE DRIFT                                        [YOUR TURN]
+# CHECK 5 -- NULL RATE DRIFT
 # ===========================================================================
 
 def check_null_rate_drift(
@@ -465,41 +464,32 @@ def check_null_rate_drift(
 
     SHAPE: AGGREGATE COMPARISON, per column, on a ratio rather than a count.
 
-    SKETCH:
-        SELECT COUNT(*) FILTER (WHERE col IS NULL) * 1.0 / COUNT(*)
-        FROM src_{table}
-        -- then the same against tgt_, and compare the two rates
+    DECISIONS TAKEN, AND WHY
 
-    (COUNT(*) FILTER (WHERE ...) is standard SQL and DuckDB supports it. It is
-    cleaner than SUM(CASE WHEN ... THEN 1 ELSE 0 END), which does the same job.)
+    1. Only columns present on BOTH sides are compared, intersected via
+       engine.columns(). A column that exists on one side only is a schema
+       difference, which is a different finding and would be misleading
+       reported as drift.
 
-    THINGS TO DECIDE
-    - Compare only columns present in BOTH src_ and tgt_. Use engine.columns()
-      to intersect them. A column that exists on one side only is a schema
-      difference, which is a different finding.
-    - Use NULL_RATE_DRIFT_TOLERANCE from config rather than hard-coding a
-      threshold, so the tolerance is visible in one place.
-    - Direction matters. Target emptier than source is a defect. Target FULLER
-      than source usually means defaults were applied during migration -- worth
-      a WARN, not a FAIL, because it is often intentional.
-    - Returns a list: one result per drifted column.
+    2. Null counts for every column are computed in ONE aggregate per side,
+       using one COUNT(*) FILTER expression per column, rather than looping in
+       Python and issuing one query per column. On a wide table the difference
+       is two queries against dozens.
 
-    IMPLEMENTATION NOTES
+       (COUNT(*) FILTER (WHERE ...) is standard SQL and DuckDB supports it. It
+       is cleaner than SUM(CASE WHEN ... THEN 1 ELSE 0 END), which does the
+       same job.)
 
-    - Only columns present on BOTH sides are compared. A column that exists on
-      one side only is a schema difference, which is a different finding and
-      would be misleading reported as drift.
+    3. The threshold comes from NULL_RATE_DRIFT_TOLERANCE in config rather than
+       being hard-coded here, so the tolerance is visible in one place.
 
-    - Null counts for every column are computed in ONE aggregate per side, using
-      one COUNT(*) FILTER expression per column, rather than looping in Python
-      and issuing one query per column. On a wide table the difference is two
-      queries against dozens.
+    4. Direction matters and is treated differently:
+         target emptier than source  -> FAIL. Data was lost.
+         target fuller than source   -> WARN. Usually defaults applied during
+                                        migration, which is often intentional,
+                                        but worth a human glance.
 
-    - Direction matters and is treated differently:
-        target emptier than source  -> FAIL. Data was lost.
-        target fuller than source   -> WARN. Usually defaults applied during
-                                       migration, which is often intentional,
-                                       but worth a human glance.
+    5. Returns a list: one result per drifted column.
     """
     src_view = f"src_{table.name}"
     tgt_view = f"tgt_{table.name}"
@@ -598,7 +588,7 @@ def check_null_rate_drift(
 
 
 # ===========================================================================
-# CHECK 6 -- VALUE LEVEL DIFF                                       [YOUR TURN]
+# CHECK 6 -- VALUE LEVEL DIFF
 # ===========================================================================
 
 def check_value_level_diff(
@@ -615,19 +605,15 @@ def check_value_level_diff(
 
     SHAPE: INNER JOIN on the primary key, then compare columns.
 
-    SKETCH:
-        SELECT s.{pk}, s.amount AS src_amount, t.amount AS tgt_amount
-        FROM src_{table} s
-        JOIN tgt_{table} t ON s.{pk} = t.{pk}
-        WHERE s.amount IS DISTINCT FROM t.amount
-
     IS DISTINCT FROM, NOT !=
     This is the detail worth getting right. In SQL, NULL != NULL is not true --
     it is NULL, which is not true, so the row is excluded. A plain != therefore
-    silently misses every row where one side is NULL. IS DISTINCT FROM treats
-    NULL as a comparable value and returns true when exactly one side is NULL.
-    Using != here is a classic reconciliation bug that makes a broken migration
-    look clean.
+    silently misses every row where exactly one side is NULL, which is
+    precisely the set of rows most worth catching. IS DISTINCT FROM treats NULL
+    as a comparable value and returns TRUE when one side is NULL and the other
+    is not. Using != here is a classic reconciliation bug that makes a broken
+    migration look clean, and a test in tests/test_checks.py fails if anyone
+    swaps the operator back.
 
     DECISIONS TAKEN, AND WHY
 
@@ -641,19 +627,17 @@ def check_value_level_diff(
     2. Floats. Exact equality on floating point produces differences that are
        artefacts of binary representation rather than migration defects, so
        numeric columns use an absolute tolerance (FLOAT_COMPARISON_TOLERANCE).
-       NULLs are still handled by IS DISTINCT FROM before the tolerance applies,
-       so a value that became NULL is always reported.
+       NULLs are still handled by IS DISTINCT FROM before the tolerance
+       applies, so a value that became NULL is always reported.
 
     3. All shared columns are compared, excluding the primary key -- it is the
        join condition, so by definition it cannot differ.
 
-    WHY IS DISTINCT FROM AND NOT !=
-    In SQL, NULL != NULL evaluates to NULL, not TRUE, so the row is filtered
-    out. A plain != therefore silently misses every row where exactly one side
-    is NULL -- precisely the rows most worth catching. IS DISTINCT FROM treats
-    NULL as a comparable value and returns TRUE when one side is NULL and the
-    other is not. Using != here is a classic reconciliation bug that makes a
-    broken migration look clean.
+    4. The inner join means rows missing from the target are simply not
+       compared. That is check 1's finding, not this one's. Keeping the
+       concerns separate is what lets the report say "12 rows missing" and "7
+       values altered" rather than conflating them into one number that
+       explains neither.
     """
     pk = table.primary_key
     src_view = f"src_{table.name}"
@@ -785,8 +769,8 @@ def check_value_level_diff(
 # REGISTRY
 # ===========================================================================
 #
-# The runner iterates this list. Order matters only for readability of the
-# report -- checks are independent of each other.
+# The runner iterates this list, and it is the authority on check order: the
+# section numbers above and the table in the README both follow it.
 #
 # Order is chosen for readability of the report: cheap structural checks first
 # (did the rows arrive, are the keys sound), then relationship and content
