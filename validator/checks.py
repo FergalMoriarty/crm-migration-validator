@@ -150,17 +150,16 @@ def check_primary_key_integrity(
        affecting 47 rows" are very different situations to walk into.
 
     3. The null count is computed separately from the duplicate query, because
-       PARTITION BY groups all nulls into one partition. A single null key
+       GROUP BY collapses all nulls into a single group. A single null key
        would therefore never appear as a duplicate and would go unreported.
 
-    4. COUNT(*) OVER (PARTITION BY pk) deliberately has NO ORDER BY. Adding one
-       changes the default frame to RANGE BETWEEN UNBOUNDED PRECEDING AND
-       CURRENT ROW, which turns the whole-partition total into a running count.
-       Here it would happen to give the right answer -- ordering by the
-       partition column makes every row a peer, and RANGE frames include peers
-       -- but it would silently under-report the moment the ORDER BY column
-       differed from the PARTITION BY column. An unordered window is the
-       whole-partition aggregate we actually want.
+    4. GROUP BY ... HAVING, not a window function. Both columns reported here
+       are functions of the key itself, so grouping collapses to one evidence
+       row per duplicated key on its own. Check 4 does the same job with
+       ROW_NUMBER() because it reports raw column values that are NOT
+       functionally dependent on what it groups by -- see its docstring. The
+       distinction is worth keeping straight: a window function earns its
+       place when you need a whole row back, not when you need a count.
     """
     pk = table.primary_key
     view = f"tgt_{table.name}"
@@ -169,22 +168,17 @@ def check_primary_key_integrity(
     null_count = engine.scalar(f'SELECT COUNT(*) FROM {view} WHERE "{pk}" IS NULL')
 
     # -- duplicates -------------------------------------------------------
-    # ROW_NUMBER() lets us collapse each duplicated key to a single evidence
-    # row (occurrence = 1) while COUNT(*) OVER still reports how many times the
-    # key appears in total. One pass, both numbers.
+    # Everything reported here -- the key and how often it occurs -- is a
+    # function of the key itself, so GROUP BY collapses to one evidence row
+    # per duplicated key natively. No window function needed.
     duplicates = engine.query(
         f"""
-        WITH keyed AS (
-            SELECT "{pk}"                                      AS pk,
-                   ROW_NUMBER() OVER (PARTITION BY "{pk}")     AS occurrence,
-                   COUNT(*)     OVER (PARTITION BY "{pk}")     AS occurrences
-            FROM {view}
-            WHERE "{pk}" IS NOT NULL
-        )
-        SELECT pk AS duplicate_pk, occurrences
-        FROM keyed
-        WHERE occurrences > 1
-          AND occurrence = 1
+        SELECT "{pk}"    AS duplicate_pk,
+               COUNT(*)  AS occurrences
+        FROM {view}
+        WHERE "{pk}" IS NOT NULL
+        GROUP BY "{pk}"
+        HAVING COUNT(*) > 1
         ORDER BY occurrences DESC, duplicate_pk
         """
     )
@@ -377,6 +371,23 @@ def check_duplicate_business_keys(
     3. Tables with no business key return an explicit PASS saying so, rather
        than being skipped. A check that quietly does nothing is worse than one
        that says it did nothing, because silence reads as success.
+
+    4. A window function here, where check 2 uses GROUP BY. This is deliberate.
+       The query partitions on the NORMALISED key but reports the RAW column
+       values, and those are not functionally dependent on what it groups by --
+       two rows in the same normalised group can differ in case and whitespace.
+       GROUP BY would force MIN()/ANY_VALUE() around every raw column to pick a
+       representative; ROW_NUMBER() = 1 returns a real row from the group
+       instead, which is what the reader of the report needs to see.
+
+    5. COUNT(*) OVER (PARTITION BY ...) deliberately has NO ORDER BY. Adding one
+       changes the default frame to RANGE BETWEEN UNBOUNDED PRECEDING AND
+       CURRENT ROW, which turns the whole-partition total into a running count.
+       Here it would happen to give the right answer -- ordering by the
+       partition expression makes every row a peer, and RANGE frames include
+       peers -- but it would silently under-report the moment the ORDER BY
+       column differed from the PARTITION BY column. An unordered window is the
+       whole-partition aggregate we actually want.
     """
     if not table.business_key:
         return CheckResult(

@@ -305,8 +305,8 @@ def test_primary_key_integrity_detects_nulls(tmp_path):
     A null primary key identifies nothing and is its own defect.
 
     Worth a separate branch because the duplicate query filters nulls out --
-    PARTITION BY groups all nulls together, so a single null key would never
-    appear as a duplicate and would go unreported without it.
+    GROUP BY collapses all nulls into a single group, so a single null key would
+    never appear as a duplicate and would go unreported without it.
     """
     source_rows = [landlord(1), landlord(2)]
     target_rows = [
