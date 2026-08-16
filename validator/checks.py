@@ -31,8 +31,10 @@ Reconciliation SQL is mostly one of three shapes:
      of migration validation: missing rows, orphaned references, unmatched
      keys are all anti-joins.
 
-  3. PARTITION AND COUNT -- find keys that occur more often than they should.
-     This is how duplicates are caught.
+  3. COUNT PER KEY -- find keys that occur more often than they should.
+     This is how duplicates are caught. GROUP BY when the evidence is only the
+     key and its count; a window function when the evidence has to include a
+     real row from each group.
 
 Almost every check below is one of those three.
 """
@@ -136,7 +138,7 @@ def check_primary_key_integrity(
     migration that loses two rows and duplicates two others reconciles
     perfectly on totals.
 
-    SHAPE: PARTITION AND COUNT, plus a null count.
+    SHAPE: COUNT PER KEY via GROUP BY, plus a null count.
 
     DECISIONS TAKEN, AND WHY
 
@@ -340,7 +342,8 @@ def check_duplicate_business_keys(
     after agency: the same landlord exists in three CRMs, and unless the
     migration deduplicates on a business key they arrive as three landlords.
 
-    SHAPE: PARTITION AND COUNT, on business_key rather than primary_key.
+    SHAPE: COUNT PER KEY via window function, on business_key rather than
+    primary_key.
 
     DECISIONS TAKEN, AND WHY
 

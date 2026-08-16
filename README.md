@@ -130,15 +130,15 @@ comment. That is what `--markdown` is for.
 | # | Check | Shape | Catches | On failure |
 |---|---|---|---|---|
 | 1 | Row count reconciliation | aggregate comparison | wholesale row loss or duplication | FAIL |
-| 2 | Primary key integrity | window functions | duplicated or null technical keys | FAIL |
+| 2 | Primary key integrity | `GROUP BY` + `HAVING` | duplicated or null technical keys | FAIL |
 | 3 | Orphaned foreign keys | anti-join | children whose parent never migrated | FAIL |
-| 4 | Duplicate business keys | window functions | the same real entity under two IDs | WARN |
+| 4 | Duplicate business keys | window function | the same real entity under two IDs | WARN |
 | 5 | Null rate drift | aggregate comparison | a column that silently stopped populating | FAIL / WARN |
 | 6 | Value level diff | inner join + `IS DISTINCT FROM` | contents changed on rows that survived | FAIL |
 
 Reconciliation SQL is almost always one of three shapes — an aggregate
-comparison, an anti-join, or a partition-and-count. The checks are organised
-around that, which is why adding a new one is short. All of the SQL lives in
+comparison, an anti-join, or a count per key. The checks are organised around
+that, which is why adding a new one is short. All of the SQL lives in
 `validator/checks.py`, alongside the reasoning for each query. The numbering
 above follows `CHECK_REGISTRY` in that file, which is the order the report
 prints in and the authority if anything ever disagrees.
@@ -156,6 +156,17 @@ Check 2 catches the same primary key appearing twice. Check 4 catches the same
 is technically valid — and completely wrong. In a roll-up, where the same
 landlord may exist in three acquired CRMs, deduplicating on a business key is
 the whole problem.
+
+They are both a count per key, but they reach it differently, and the reason is
+worth stating. Check 2 reports only the key and how often it occurs — both
+functions of the key itself — so `GROUP BY` collapses each duplicated key to one
+evidence row on its own. Check 4 groups on a *normalised* key
+(`LOWER(TRIM(...))`) while reporting the raw column values, and those are not
+functionally dependent on what it groups by: two rows in the same group can
+differ in case and whitespace. `GROUP BY` would force `MIN()` around every raw
+column to pick a representative, so check 4 uses `ROW_NUMBER() = 1` to return a
+real row from each group instead. The rule of thumb: group when you need a
+count, window when you need a row back.
 
 ### Verifying it against known defects
 
