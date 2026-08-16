@@ -383,13 +383,26 @@ def check_duplicate_business_keys(
        representative; ROW_NUMBER() = 1 returns a real row from the group
        instead, which is what the reader of the report needs to see.
 
-    5. COUNT(*) OVER (PARTITION BY ...) deliberately has NO ORDER BY. Adding one
-       changes the default frame to RANGE BETWEEN UNBOUNDED PRECEDING AND
-       CURRENT ROW, which turns the whole-partition total into a running count.
-       Here it would happen to give the right answer -- ordering by the
-       partition expression makes every row a peer, and RANGE frames include
-       peers -- but it would silently under-report the moment the ORDER BY
-       column differed from the PARTITION BY column. An unordered window is the
+    5. That representative row's primary key is reported as example_id. Telling
+       someone two landlords share an email without telling them which records
+       to open leaves them to find it themselves, and check 3 already sets the
+       precedent of naming the offending row.
+
+    6. The two windows are ordered differently, on purpose.
+
+       ROW_NUMBER() IS ordered, by primary key. Without an ORDER BY the engine
+       may return any row of the partition, so the reported example_id could
+       change between runs on unchanged data -- and a piece of evidence that
+       moves when nothing moved is worse than no evidence. Ordering by the key
+       makes the lowest-numbered record the representative, every time.
+
+       COUNT(*) OVER deliberately has NO ORDER BY. Adding one changes the
+       default frame to RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW,
+       which turns the whole-partition total into a running count. Here it
+       would happen to give the right answer -- ordering by the partition
+       expression makes every row a peer, and RANGE frames include peers --
+       but it would silently under-report the moment the ORDER BY column
+       differed from the PARTITION BY column. An unordered window is the
        whole-partition aggregate we actually want.
     """
     if not table.business_key:
@@ -410,16 +423,21 @@ def check_duplicate_business_keys(
     )
     raw_columns = ", ".join(f'"{col}"' for col in table.business_key)
 
+    # Note the deliberate asymmetry between the two windows: ROW_NUMBER() is
+    # ordered so the representative row is stable across runs, COUNT(*) OVER is
+    # not so it stays a whole-partition total. See decision 6 above.
     duplicates = engine.query(
         f"""
         WITH keyed AS (
             SELECT {raw_columns},
-                   "{table.primary_key}"                          AS example_id,
-                   ROW_NUMBER() OVER (PARTITION BY {normalised})  AS occurrence,
-                   COUNT(*)     OVER (PARTITION BY {normalised})  AS occurrences
+                   "{table.primary_key}"                         AS example_id,
+                   ROW_NUMBER() OVER (PARTITION BY {normalised}
+                                      ORDER BY "{table.primary_key}")
+                                                                 AS occurrence,
+                   COUNT(*)     OVER (PARTITION BY {normalised}) AS occurrences
             FROM {view}
         )
-        SELECT {raw_columns}, occurrences
+        SELECT {raw_columns}, example_id, occurrences
         FROM keyed
         WHERE occurrences > 1
           AND occurrence = 1
